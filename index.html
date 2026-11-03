@@ -315,8 +315,8 @@ function mark(id, good){
   const s = SRS[id] || {b: 0, d: today()};
   if (good){ s.b = Math.min(5, s.b + 1); s.d = today() + INTERVALS[s.b]; }
   else { s.b = 0; s.d = today(); }
-  s.m = Math.max(s.m || 0, s.b);
-  SRS[id] = s; store.set('mdr-srs', SRS); logDay();
+  s.m = Math.max(s.m || 0, s.b); s.t = Date.now();
+  SRS[id] = s; store.set('mdr-srs', SRS); logDay(); scheduleSync();
 }
 /* oefendagen (voor de reeks) */
 let DAYS = store.get('mdr-days', []);
@@ -901,7 +901,7 @@ function judge(c, user){
     p.setAttribute('d', data[0][k]); p.setAttribute('fill', 'var(--fg)'); ink.appendChild(p);
     WR.k++; WR.miss = 0;
     fb.className = 'feedback good'; fb.textContent = WR.k < data[0].length ? `Goed! Streep ${WR.k} van ${data[0].length}` : '';
-    if (WR.k >= data[0].length){ WR.done = true; const prev = WRITEDONE[c]; WRITEDONE[c] = prev === undefined ? WR.totalMiss : Math.min(prev, WR.totalMiss); store.set('mdr-write', WRITEDONE); logDay(); showDone(c); speak(c); }
+    if (WR.k >= data[0].length){ WR.done = true; const prev = WRITEDONE[c]; WRITEDONE[c] = prev === undefined ? WR.totalMiss : Math.min(prev, WR.totalMiss); store.set('mdr-write', WRITEDONE); logDay(); scheduleSync(); showDone(c); speak(c); }
     return;
   }
   WR.miss++; WR.totalMiss++;
@@ -959,16 +959,120 @@ function exportCode(){
   if (!o['mdr-srs']) o['mdr-srs'] = JSON.stringify(SRS); if (!o['mdr-write']) o['mdr-write'] = JSON.stringify(WRITEDONE); if (!o['mdr-days']) o['mdr-days'] = JSON.stringify(DAYS);
   return 'MDR1:' + btoa(unescape(encodeURIComponent(JSON.stringify(o))));
 }
+function mergeData(d){
+  let ch = false;
+  const srs = d.srs || {};
+  Object.keys(srs).forEach(id => {
+    const r = srs[id], l = SRS[id]; if (!r || typeof r.b !== 'number') return;
+    if (!l){ SRS[id] = r; ch = true; return; }
+    const rt = r.t || 0, lt = l.t || 0;
+    const win = rt > lt ? r : lt > rt ? l : (Math.max(r.m || 0, r.b) > Math.max(l.m || 0, l.b) ? r : l);
+    const m = Math.max(r.m || 0, r.b, l.m || 0, l.b);
+    if (win !== l || (l.m || 0) !== m){ SRS[id] = Object.assign({}, win, {m}); ch = true; }
+  });
+  const wd = d.write || {};
+  Object.keys(wd).forEach(c => { if (typeof wd[c] === 'number' && (WRITEDONE[c] === undefined || wd[c] < WRITEDONE[c])){ WRITEDONE[c] = wd[c]; ch = true; } });
+  const before = DAYS.length;
+  DAYS = [...new Set([...DAYS, ...(Array.isArray(d.days) ? d.days : [])])].sort((x, y) => x - y).slice(-400);
+  if (DAYS.length !== before) ch = true;
+  store.set('mdr-srs', SRS); store.set('mdr-write', WRITEDONE); store.set('mdr-days', DAYS);
+  return ch;
+}
 function importCode(code){
   code = code.trim(); if (!code.startsWith('MDR1:')) throw new Error('code');
   const o = JSON.parse(decodeURIComponent(escape(atob(code.slice(5)))));
   const J = k => { try{ return JSON.parse(o[k] || 'null'); }catch(e){ return null; } };
-  const srs = J('mdr-srs') || {}; Object.keys(srs).forEach(id => { const a = SRS[id], b = srs[id]; if (!a || Math.max(b.m || 0, b.b) > Math.max(a.m || 0, a.b)) SRS[id] = b; });
-  const wd = J('mdr-write') || {}; Object.keys(wd).forEach(c => { WRITEDONE[c] = WRITEDONE[c] === undefined ? wd[c] : Math.min(WRITEDONE[c], wd[c]); });
-  DAYS = [...new Set([...DAYS, ...(J('mdr-days') || [])])].sort((x, y) => x - y).slice(-400);
-  const st = J('mdr-set'); if (st) Object.assign(SETTINGS, st);
-  store.set('mdr-srs', SRS); store.set('mdr-write', WRITEDONE); store.set('mdr-days', DAYS); store.set('mdr-set', SETTINGS);
+  const srs = J('mdr-srs') || {};
+  mergeData({srs, write: J('mdr-write') || {}, days: J('mdr-days') || []});
   return Object.keys(srs).length;
+}
+/* ---- automatisch synchroniseren via een privé GitHub Gist ---- */
+const SYNCFILE = 'mandarijn-voortgang.json';
+const SYNCHERE = location.protocol === 'https:' && /github\.io$/.test(location.hostname) || /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
+let SYNC = store.get('mdr-sync', null), SYNCBUSY = false, SYNCTIMER = null, SYNCSTATE = SYNC && SYNC.last ? 'ok' : '';
+async function gh(path, opt = {}){
+  const headers = {'Authorization': 'Bearer ' + SYNC.token, 'Accept': 'application/vnd.github+json'};
+  if (opt.body) headers['Content-Type'] = 'application/json';
+  const r = await fetch('https://api.github.com' + path, Object.assign({}, opt, {headers, cache: 'no-store'}));
+  if (!r.ok){ const e = new Error('http ' + r.status); e.status = r.status; throw e; }
+  return r.status === 204 ? null : r.json();
+}
+function syncPayload(){ return JSON.stringify({v: 1, updated: new Date().toISOString(), srs: SRS, write: WRITEDONE, days: DAYS}); }
+async function findGist(){
+  for (let page = 1; page <= 5; page++){
+    const list = await gh('/gists?per_page=100&page=' + page);
+    const g = list.find(x => x.files && x.files[SYNCFILE]); if (g) return g.id;
+    if (list.length < 100) break;
+  }
+  const g = await gh('/gists', {method: 'POST', body: JSON.stringify({description: 'Mandarijn Oefenapp – voortgang (niet verwijderen)', public: false, files: {[SYNCFILE]: {content: syncPayload()}}})});
+  return g.id;
+}
+function setSync(st){
+  SYNCSTATE = st;
+  const el = document.getElementById('syncStatus'); if (el) el.innerHTML = syncStatusText();
+}
+function syncStatusText(){
+  const t = SYNC && SYNC.last ? new Date(SYNC.last).toLocaleTimeString('nl-NL', {hour: '2-digit', minute: '2-digit'}) : '';
+  const d = SYNC && SYNC.last && new Date(SYNC.last).toDateString() !== new Date().toDateString() ? new Date(SYNC.last).toLocaleDateString('nl-NL', {day: 'numeric', month: 'short'}) + ' ' : '';
+  return ({busy: '🔄 Bezig met synchroniseren…', ok: `✅ Gesynchroniseerd (${d}${t})`, offline: '📴 Geen internet. Je voortgang wordt bijgewerkt zodra je weer online bent.',
+    badtoken: '⚠️ De sleutel werkt niet (meer). Ontkoppel en maak een nieuwe sleutel aan.', err: '⚠️ Synchroniseren lukte even niet. De app probeert het straks opnieuw.'})[SYNCSTATE] || '';
+}
+async function syncNow(){
+  if (!SYNCHERE || !SYNC || !SYNC.token || SYNCBUSY) return false;
+  if (navigator.onLine === false){ setSync('offline'); return false; }
+  SYNCBUSY = true; setSync('busy'); let ch = false;
+  try{
+    if (!SYNC.gist){ SYNC.gist = await findGist(); store.set('mdr-sync', SYNC); }
+    const g = await gh('/gists/' + SYNC.gist);
+    const f = g.files && g.files[SYNCFILE];
+    if (f){
+      let txt = f.content;
+      if (f.truncated && f.raw_url) txt = await (await fetch(f.raw_url, {cache: 'no-store'})).text();
+      try{ ch = mergeData(JSON.parse(txt)); }catch(e){}
+    }
+    await gh('/gists/' + SYNC.gist, {method: 'PATCH', body: JSON.stringify({files: {[SYNCFILE]: {content: syncPayload()}}})});
+    SYNC.last = Date.now(); store.set('mdr-sync', SYNC); SYNCBUSY = false; setSync('ok');
+    if (ch && (TAB === 'route' || TAB === 'leren')){ const sy = window.scrollY; render(); window.scrollTo(0, sy); }
+    return true;
+  }catch(e){
+    SYNCBUSY = false;
+    if (e.status === 404 && SYNC.gist){ SYNC.gist = null; store.set('mdr-sync', SYNC); }
+    setSync(e.status === 401 ? 'badtoken' : navigator.onLine === false ? 'offline' : 'err');
+    return false;
+  }
+}
+function scheduleSync(){ if (!SYNCHERE || !SYNC) return; clearTimeout(SYNCTIMER); SYNCTIMER = setTimeout(syncNow, 4000); }
+if (SYNCHERE){
+  document.addEventListener('visibilitychange', () => { if (SYNC) syncNow(); });
+  window.addEventListener('online', () => { if (SYNC) syncNow(); });
+}
+function syncCard(){
+  if (!SYNCHERE) return '';
+  if (SYNC && SYNC.token) return `<div class="card" style="margin-top:12px"><b>☁️ Synchroniseren tussen apparaten</b>
+    <p class="muted" style="font-size:.88rem;margin:6px 0">Aan. Je voortgang wordt automatisch bewaard en gedeeld met je andere apparaten, telkens als je oefent of de app opent.</p>
+    <div id="syncStatus" style="font-weight:700;font-size:.92rem">${syncStatusText()}</div>
+    <div class="row" style="margin-top:10px"><button id="syncGo">🔄 Nu synchroniseren</button><button id="syncOff" class="small">Ontkoppel dit apparaat</button></div></div>`;
+  return `<div class="card" style="margin-top:12px"><b>☁️ Synchroniseren tussen apparaten</b>
+    <p class="muted" style="font-size:.88rem;margin:6px 0">Dezelfde voortgang op je iPad én je telefoon. Je doet dit één keer per apparaat. Op het tweede apparaat gebruik je dezelfde sleutel.</p>
+    <ol style="font-size:.9rem;padding-left:20px;margin:6px 0">
+      <li><a href="https://github.com/settings/tokens/new?scopes=gist&description=Mandarijn%20app" target="_blank" rel="noopener">Maak een sleutel aan op GitHub</a> (log in als dat gevraagd wordt). Kies bij <b>Expiration</b>: <i>No expiration</i>. Laat het vinkje bij <b>gist</b> aan staan. Tik onderaan op <b>Generate token</b>.</li>
+      <li>Kopieer de sleutel (begint met <code>ghp_</code>) en plak hem hieronder. Bewaar hem ook in Notities, voor je andere apparaat.</li>
+    </ol>
+    <input id="syncTok" type="password" autocomplete="off" placeholder="ghp_…" style="width:100%;font-size:1rem;border-radius:10px;border:1px solid var(--line);padding:10px;background:var(--surface2);color:var(--fg)">
+    <div class="row" style="margin-top:8px"><button class="primary" id="syncOn">Koppel</button><span id="syncStatus" class="muted" style="font-size:.88rem"></span></div></div>`;
+}
+function bindSync(){
+  const on = document.getElementById('syncOn');
+  if (on) on.addEventListener('click', async () => {
+    const tok = document.getElementById('syncTok').value.trim(), st = document.getElementById('syncStatus');
+    if (!/^(ghp_|github_pat_)[A-Za-z0-9_]{20,}$/.test(tok)){ st.textContent = 'Dit lijkt geen sleutel. Hij begint met ghp_ en is lang.'; return; }
+    SYNC = {token: tok}; on.disabled = true; st.textContent = '🔄 Bezig met koppelen…';
+    const ok = await syncNow();
+    if (!ok){ const msg = SYNCSTATE === 'badtoken' ? 'Deze sleutel werkt niet. Controleer of het vinkje bij "gist" aan stond.' : 'Koppelen lukte niet. Heb je internet?'; SYNC = null; on.disabled = false; st.textContent = msg; return; }
+    store.set('mdr-sync', SYNC); const sy = window.scrollY; renderRoute(); window.scrollTo(0, sy);
+  });
+  const go = document.getElementById('syncGo'); if (go) go.addEventListener('click', () => syncNow());
+  const off = document.getElementById('syncOff'); if (off) off.addEventListener('click', () => { SYNC = null; SYNCSTATE = ''; try{ localStorage.removeItem('mdr-sync'); }catch(e){} const sy = window.scrollY; renderRoute(); window.scrollTo(0, sy); });
 }
 function bindTransfer(){
   const msg = document.getElementById('xmsg'), ta = document.getElementById('xcode');
@@ -1012,6 +1116,7 @@ function renderRoute(){
       <div class="bar" style="height:10px;margin-top:12px"><i style="width:${Math.round(totalP * 100)}%"></i></div>
       <p class="muted" style="font-size:.85rem;margin:8px 0 0">De rondjes vullen zich vanzelf als je oefent: elk goed antwoord bij flashcards of de quiz en elk karakter dat je schrijft telt mee. Een woord telt als <b>geleerd</b> als je het op 3 verschillende momenten goed hebt. Je hoeft niets zelf af te vinken.</p>
     </div>`;
+  h += syncCard();
   let lastB = 0;
   const OFF = [0, 46, 70, 46, 0, -46, -70, -46];
   weeks.forEach((x, idx) => {
@@ -1042,7 +1147,7 @@ function renderRoute(){
     <textarea id="xcode" rows="3" style="width:100%;margin-top:10px;font-size:.8rem;border-radius:10px;border:1px solid var(--line);padding:8px;background:var(--surface2);color:var(--fg)" placeholder="Plak hier de code van de andere plek"></textarea>
     <div class="row" style="margin-top:8px"><button id="ximport">⬇️ Zet voortgang over</button><span id="xmsg" class="muted" style="font-size:.88rem"></span></div></details>`;
   view.innerHTML = h;
-  bindTransfer();
+  bindTransfer(); bindSync();
   const selW = weeks.find(x => x.wk.w === ROUTESEL);
   view.querySelectorAll('.node').forEach(b => b.addEventListener('click', () => { ROUTESEL = +b.dataset.w; const sy = window.scrollY; renderRoute(); window.scrollTo(0, sy); }));
   view.querySelectorAll('input[data-id]').forEach(cb => cb.addEventListener('change', () => {
@@ -1060,6 +1165,7 @@ function renderRoute(){
 /* start */
 const startTab = location.hash.slice(1);
 setTab(['leren','flash','schrijf','quiz','tonen','route'].includes(startTab) ? startTab : 'leren');
+if (SYNCHERE && SYNC) setTimeout(syncNow, 800);
 window.APPREADY = true; if (ZHVOICES.length) window.VOICESHOWN = true;
 </script>
 
